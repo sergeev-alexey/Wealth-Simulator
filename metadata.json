@@ -1,0 +1,6 @@
+{
+  "name": "Wealth Simulator",
+  "description": "Monte Carlo wealth simulator combining AI-driven financial scenarios with mathematical projections.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
