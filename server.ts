@@ -118,8 +118,10 @@ app.post("/api/chat", async (req, res) => {
     }
 
     const totalTokens = interaction.usage?.total_tokens || 0;
-    // Gemini 2.5 Flash has a context window of 1 million tokens (1000000)
-    const contextConsumed = ((totalTokens / 1000000) * 100).toFixed(4);
+    // Fetch actual model limits instead of hardcoding
+    const modelInfo = await ai.models.get({ model: "gemini-3.5-flash" });
+    const maxTokens = modelInfo.inputTokenLimit || 1000000;
+    const contextConsumed = ((totalTokens / maxTokens) * 100).toFixed(4);
     
     fullOutput += `\n\n[Session Context Consumed: ${contextConsumed}%]`;
 
