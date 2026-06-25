@@ -39,6 +39,7 @@ export default function App() {
   const [inputMsg, setInputMsg] = useState("");
   const [loading, setLoading] = useState(false);
   const [interactionId, setInteractionId] = useState<string | null>(null);
+  const [cumulativeTokens, setCumulativeTokens] = useState<number>(0);
 
   const currentChartData = messages
     .slice()
@@ -47,8 +48,8 @@ export default function App() {
 
   const sendMessage = async () => {
     if (!inputMsg.trim()) return;
-    const newMessages = [...messages, { role: "user", text: inputMsg }];
-    setMessages(newMessages as ChatMessage[]);
+    const newMessages: ChatMessage[] = [...messages, { role: "user", text: inputMsg }];
+    setMessages(newMessages);
     setInputMsg("");
     setLoading(true);
 
@@ -59,6 +60,7 @@ export default function App() {
         body: JSON.stringify({
           message: inputMsg,
           previousInteractionId: interactionId,
+          priorTokens: cumulativeTokens,
         }),
       });
 
@@ -88,11 +90,14 @@ export default function App() {
         }
 
         setInteractionId(data.interactionId);
+        if (data.totalTokens !== undefined) {
+          setCumulativeTokens(data.totalTokens);
+        }
         setMessages([...newMessages, { role: "assistant", text, chartData }]);
       } else {
         setMessages([
           ...newMessages,
-          { role: "assistant", text: "Error: " + data.error },
+          { role: "assistant", text: "Error:\n```json\n" + data.error + "\n```" },
         ]);
       }
     } catch (e) {
