@@ -11,7 +11,49 @@ const PORT = 3000;
 
 app.use(express.json());
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const ai = new GoogleGenAI({ 
+  apiKey: process.env.GEMINI_API_KEY,
+  httpOptions: { retryOptions: { attempts: 1 } }
+});
+
+const LOOPS = 10000;
+const MIN_YEARS = 5;
+const MAX_YEARS = 50;
+const FIRE_THRESHOLD = 0.85;
+const DEFAULT_WITHDRAWAL_RATE = 0.04;
+const DEFAULT_TOKEN_LIMIT = 1_048_576;
+
+const modelLimitCache = new Map<string, number>();
+
+async function getModelLimit(model: string): Promise<number> {
+  if (modelLimitCache.has(model)) {
+    return modelLimitCache.get(model)!;
+  }
+  try {
+    const modelInfo = await ai.models.get({ model });
+    const limit = modelInfo.inputTokenLimit || DEFAULT_TOKEN_LIMIT;
+    modelLimitCache.set(model, limit);
+    return limit;
+  } catch (err) {
+    console.error(`Failed to fetch model limit for ${model}:`, err);
+    return DEFAULT_TOKEN_LIMIT;
+  }
+}
+
+function extractModelOutput(interaction: any): string {
+  let output = "";
+  if (interaction && interaction.steps) {
+    for (const step of interaction.steps) {
+      if (step.type === "model_output") {
+        const textContent = step.content?.find((c: any) => c.type === "text") as any;
+        if (textContent && textContent.text) {
+          output += textContent.text;
+        }
+      }
+    }
+  }
+  return output;
+}
 
 const SYSTEM_INSTRUCTION = `You are a Wealth Optimization AI Assistant.
 For the simulation, we use a high-performance local Node.js TypeScript execution engine.
@@ -70,33 +112,44 @@ After calling the tool, your response MUST be concise and strictly include:
 
 Do not manually include the \`chartData\` JSON block or the \`[Session Context Consumed]\` tracker.`;
 
-function runMonteCarlo(params: { currentWealth?: number, annualSavings?: number, years?: number, stockGrowthMean?: number, stockGrowthStdDev?: number, inflationMean?: number, inflationStdDev?: number, annualExpenses?: number, withdrawalRate?: number }) {
+interface SimParams {
+  currentWealth?: number;
+  annualSavings?: number;
+  years?: number;
+  stockGrowthMean?: number;
+  stockGrowthStdDev?: number;
+  inflationMean?: number;
+  inflationStdDev?: number;
+  annualExpenses?: number;
+  withdrawalRate?: number;
+}
+
+function runMonteCarlo(params: SimParams) {
   const { currentWealth, annualSavings, years, stockGrowthMean, stockGrowthStdDev, inflationMean, inflationStdDev, annualExpenses, withdrawalRate } = params;
-  const safeYears = Math.min(Math.max(years || 30, 5), 50);
-  const LOOPS = 10000;
+  const safeYears = Math.min(Math.max(years || 30, MIN_YEARS), MAX_YEARS);
   const resultsByYear: { p5: number, p50: number, p95: number, year: number, prob?: number }[] = [];
   
-  const target = (annualExpenses || 0) > 0 ? (annualExpenses! / (withdrawalRate || 0.04)) : null;
+  const target = (annualExpenses || 0) > 0 ? (annualExpenses! / (withdrawalRate || DEFAULT_WITHDRAWAL_RATE)) : null;
   let fireYear: number | null = null;
   
+  const currentWealths = new Float64Array(LOOPS);
+  currentWealths.fill(currentWealth || 0);
+
   for (let y = 1; y <= safeYears; y++) {
-    const endpoints = new Float64Array(LOOPS);
     for (let i = 0; i < LOOPS; i++) {
-      let wealth = currentWealth || 0;
-      for (let j = 0; j < y; j++) {
-        // Standard Box-Muller Transform for standard normal distribution variables
-        const u1 = Math.random(), u2 = Math.random();
-        const zStock = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-        const zInfl = Math.sqrt(-2.0 * Math.log(u1)) * Math.sin(2.0 * Math.PI * u2);
-        
-        const growth = (stockGrowthMean || 0.08) + zStock * (stockGrowthStdDev || 0.15);
-        const infl = (inflationMean || 0.03) + zInfl * (inflationStdDev || 0.02);
-        
-        const realGrowth = (1 + growth) / (1 + infl) - 1;
-        wealth = wealth * (1 + realGrowth) + (annualSavings || 0);
-      }
-      endpoints[i] = wealth;
+      // Standard Box-Muller Transform for standard normal distribution variables
+      const u1 = Math.random(), u2 = Math.random();
+      const zStock = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+      const zInfl = Math.sqrt(-2.0 * Math.log(u1)) * Math.sin(2.0 * Math.PI * u2);
+      
+      const growth = (stockGrowthMean || 0.08) + zStock * (stockGrowthStdDev || 0.15);
+      const infl = (inflationMean || 0.03) + zInfl * (inflationStdDev || 0.02);
+      
+      const realGrowth = (1 + growth) / (1 + infl) - 1;
+      currentWealths[i] = currentWealths[i] * (1 + realGrowth) + (annualSavings || 0);
     }
+    
+    const endpoints = new Float64Array(currentWealths);
     endpoints.sort();
     
     let prob = 0;
@@ -109,7 +162,7 @@ function runMonteCarlo(params: { currentWealth?: number, annualSavings?: number,
          }
       }
       prob = (LOOPS - idx) / LOOPS;
-      if (fireYear === null && prob >= 0.85) {
+      if (fireYear === null && prob >= FIRE_THRESHOLD) {
          fireYear = new Date().getFullYear() + y;
       }
     }
@@ -127,11 +180,11 @@ function runMonteCarlo(params: { currentWealth?: number, annualSavings?: number,
 
 app.post("/api/chat", async (req, res) => {
   try {
+    let apiCallCount = 0;
     let { message, previousInteractionId, priorTokens } = req.body;
     
-    let mode = "local";
-    // Default to 2.5-flash for demo reliability (avoids 3.5-flash quota limits)
-    let model = "gemini-2.5-flash";
+    let mode = "tool";
+    let model = "gemini-3.1-flash-lite";
     let isModeTool = false;
     let isModelOverride = false;
     let dropConfig = false;
@@ -186,6 +239,7 @@ app.post("/api/chat", async (req, res) => {
     const omitConfig = dropConfig && !!previousInteractionId;
 
     if (mode === "tool") {
+      apiCallCount++;
       const interaction = await ai.interactions.create({
         model: model,
         system_instruction: omitConfig ? undefined : SYSTEM_INSTRUCTION_TOOL,
@@ -219,9 +273,10 @@ app.post("/api/chat", async (req, res) => {
       const fnCall = interaction.steps.find((s: any) => s.type === "function_call") as any;
       if (fnCall && fnCall.name === "run_monte_carlo") {
         try {
-          const params = fnCall.arguments;
-          const { resultsByYear } = runMonteCarlo(params);
+          const params = typeof fnCall.arguments === "string" ? JSON.parse(fnCall.arguments) : fnCall.arguments;
+          const { resultsByYear, fireYear, target } = runMonteCarlo(params);
           
+          apiCallCount++;
           finalInteraction = await ai.interactions.create({
             model: model,
             previous_interaction_id: interaction.id,
@@ -229,7 +284,7 @@ app.post("/api/chat", async (req, res) => {
                type: "function_result",
                call_id: fnCall.id,
                name: fnCall.name,
-               result: { chartData: resultsByYear }
+               result: { chartData: resultsByYear, fireYear, target }
             }]
           });
           turnDelta += finalInteraction.usage?.total_tokens || 0;
@@ -240,20 +295,14 @@ app.post("/api/chat", async (req, res) => {
         }
       }
 
-      for (const step of finalInteraction.steps) {
-        if (step.type === "model_output") {
-          const textContent = step.content?.find((c: any) => c.type === "text") as any;
-          if (textContent && textContent.text) {
-            fullOutput += textContent.text;
-          }
-        }
-      }
+      fullOutput += extractModelOutput(finalInteraction);
 
       fullOutput += chartDataBlock;
 
     } else {
       // mode:local path
       // Note: This path now makes 2 model calls per turn.
+      apiCallCount++;
       const interaction = await ai.interactions.create({
         model: model,
         system_instruction: omitConfig ? undefined : SYSTEM_INSTRUCTION,
@@ -264,14 +313,7 @@ app.post("/api/chat", async (req, res) => {
       turnDelta += interaction.usage?.total_tokens || 0;
       finalInteraction = interaction;
 
-      for (const step of interaction.steps) {
-        if (step.type === "model_output") {
-          const textContent = step.content?.find((c: any) => c.type === "text") as any;
-          if (textContent && textContent.text) {
-            fullOutput += textContent.text;
-          }
-        }
-      }
+      fullOutput += extractModelOutput(interaction);
 
       // Intercept Simulation Params to run our local fast TS 10,000-loop Monte Carlo
       const paramMatch = fullOutput.match(/```json\s+simulationParams([\s\S]+?)```/i) || fullOutput.match(/```json(?:.*?)\n([\s\S]*?"currentWealth"[\s\S]*?)\n```/i);
@@ -314,6 +356,7 @@ ${milestoneText}
 INSTRUCTION:
 Write the "3. Result:" section based strictly on the above numbers. Do not invent any numbers. Keep it concise with appropriate uncertainty.`;
 
+          apiCallCount++;
           const turn2Interaction = await ai.interactions.create({
             model: model,
             input: secondTurnInput,
@@ -323,15 +366,7 @@ Write the "3. Result:" section based strictly on the above numbers. Do not inven
           turnDelta += turn2Interaction.usage?.total_tokens || 0;
           finalInteraction = turn2Interaction;
           
-          let turn2Text = "";
-          for (const step of turn2Interaction.steps) {
-            if (step.type === "model_output") {
-              const textContent = step.content?.find((c: any) => c.type === "text") as any;
-              if (textContent && textContent.text) {
-                turn2Text += textContent.text;
-              }
-            }
-          }
+          let turn2Text = extractModelOutput(turn2Interaction);
           
           fullOutput = turn1Text + "\n\n" + turn2Text;
           
@@ -347,22 +382,23 @@ Write the "3. Result:" section based strictly on the above numbers. Do not inven
       fullOutput += chartDataBlock;
     }
 
-    const modelInfo = await ai.models.get({ model: model });
-    const maxTokens = modelInfo.inputTokenLimit || 1000000;
+    const maxTokens = await getModelLimit(model);
     
     let newCumulative = (priorTokens || 0) + turnDelta;
     const contextConsumed = ((newCumulative / maxTokens) * 100).toFixed(4);
     
-    fullOutput += `\n\n[Session Context Consumed: ${contextConsumed}% — cumulative, summed client-side because per-call counts are not cumulative]`;
+    fullOutput += `\n\n[Session Context Consumed: ${contextConsumed}% - cumulative, summed client-side because per-call counts are not cumulative]`;
 
     if (Number(contextConsumed) > CONTEXT_BUDGET_PCT) {
-      fullOutput += `\n⚠ Context budget exceeded (${contextConsumed}% > ${CONTEXT_BUDGET_PCT}%). The Interactions API emits no native event for this — tracked client-side.`;
+      fullOutput += `\n⚠ Context budget exceeded (${contextConsumed}% > ${CONTEXT_BUDGET_PCT}%). The Interactions API emits no native event for this - tracked client-side.`;
     }
 
     if (isModeTool || isModelOverride || dropConfig) {
       const dropLabel = dropConfig ? " | config dropped" : "";
       fullOutput += `\n\n[path: ${mode} | model: ${model}${dropLabel}]`;
     }
+
+    console.log(`Total API calls for request: ${apiCallCount}`);
 
     res.json({
       text: fullOutput,
@@ -377,6 +413,14 @@ Write the "3. Result:" section based strictly on the above numbers. Do not inven
 });
 
 async function startServer() {
+  try {
+    await getModelLimit("gemini-3.5-flash");
+    await getModelLimit("gemini-2.5-flash");
+    await getModelLimit("gemini-3.1-flash-lite");
+  } catch (err) {
+    console.error("Failed to pre-warm model limits", err);
+  }
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
